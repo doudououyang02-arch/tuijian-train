@@ -1,9 +1,10 @@
 import os
 from dataclasses import asdict, dataclass
-from typing import Dict, Tuple
+from typing import Dict, Iterable, Tuple
 
 import torch
 import torch.nn as nn
+from peft import LoraConfig, TaskType, get_peft_model, mark_only_lora_as_trainable
 from transformers import AutoModel, AutoTokenizer
 
 
@@ -20,6 +21,11 @@ class DualEncoderConfig:
     base_model_name: str
     projection_dim: int
     dropout: float = 0.1
+    use_lora: bool = False
+    lora_r: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.05
+    lora_target_modules: Iterable[str] = ("query", "key", "value")
 
 
 class DualEncoderModel(nn.Module):
@@ -27,6 +33,17 @@ class DualEncoderModel(nn.Module):
         super().__init__()
         self.config = config
         self.encoder = AutoModel.from_pretrained(config.base_model_name)
+        if config.use_lora:
+            lora_cfg = LoraConfig(
+                r=config.lora_r,
+                lora_alpha=config.lora_alpha,
+                lora_dropout=config.lora_dropout,
+                bias="none",
+                task_type=TaskType.FEATURE_EXTRACTION,
+                target_modules=list(config.lora_target_modules),
+            )
+            self.encoder = get_peft_model(self.encoder, lora_cfg)
+            mark_only_lora_as_trainable(self.encoder)
         hidden_size = self.encoder.config.hidden_size
         projection_dim = config.projection_dim or hidden_size
         self.head_a = nn.Sequential(

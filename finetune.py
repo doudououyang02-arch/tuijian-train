@@ -5,6 +5,8 @@ import os
 import random
 from typing import Dict, List, Tuple
 
+import jieba
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -59,16 +61,21 @@ class TextPairDataset(Dataset):
             parts.append(f"{field}: {value}")
         return " \n ".join(parts)
 
+    def _segment_words(self, text: str) -> List[str]:
+        words = [w for w in jieba.lcut(text, cut_all=False) if w.strip()]
+        return words
+
     def _apply_mask(self, text: str) -> str:
-        tokens = self.tokenizer.tokenize(text)
-        if not tokens:
+        words = self._segment_words(text)
+        if not words:
             return text
         ratio = random.uniform(self.mask_ratio[0], self.mask_ratio[1])
-        mask_count = max(1, int(len(tokens) * ratio))
-        mask_indices = random.sample(range(len(tokens)), k=mask_count)
+        mask_count = max(1, int(len(words) * ratio))
+        mask_indices = random.sample(range(len(words)), k=mask_count)
+        mask_token = self.tokenizer.mask_token or "[MASK]"
         for idx in mask_indices:
-            tokens[idx] = self.tokenizer.mask_token or "[MASK]"
-        return self.tokenizer.convert_tokens_to_string(tokens)
+            words[idx] = mask_token
+        return "".join(words)
 
     def __getitem__(self, idx):
         json_path = self.samples[idx]
@@ -127,6 +134,11 @@ def train(args):
         base_model_name=args.base_model,
         projection_dim=args.projection_dim or tokenizer.model_max_length,
         dropout=args.dropout,
+        use_lora=args.train_mode == "lora",
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_target_modules=[m.strip() for m in args.lora_target_modules.split(",") if m.strip()] or ("query", "key", "value"),
     )
     model = DualEncoderModel(config).to(device)
 
@@ -188,6 +200,22 @@ def parse_args():
     parser.add_argument("--max_length", type=int, default=512, help="Maximum sequence length for tokenization.")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--train_mode",
+        type=str,
+        choices=["fc", "lora"],
+        default="fc",
+        help="Choose between full-parameter training ('fc') or LoRA-based training ('lora').",
+    )
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank.")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha scaling.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout.")
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="query,key,value",
+        help="Comma-separated module name substrings to apply LoRA adapters to.",
+    )
     parser.add_argument("--cpu", action="store_true", help="Force CPU training even if CUDA is available.")
     return parser.parse_args()
 
