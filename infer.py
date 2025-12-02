@@ -1,90 +1,54 @@
-from FlagEmbedding import BGEM3FlagModel
-import numpy as np
-from sentence_transformers import util
-import torch
-import shutil
+import argparse
 import os
+import shutil
 
-m3 = BGEM3FlagModel("/mnt/vdb2t_1/sujunyan/program/ui/image_features_extract/models/baai_bge-m3/baai_bg3-m3", use_fp16=False)  # 1024 维，最长 8192 tokens
+import numpy as np
+import torch
+from sentence_transformers import util
 
-# 保存到本地
-text_embeddings_matrix = np.load("text_embeddings_8820.npy")
-    
-
-path_matrix = np.load("path_matrix_8820.npy")
+from models import load_model
 
 
-def cosine(a, b):  # a:[d], b:[N,d]
-    a = a / (np.linalg.norm(a) + 1e-9)
-    b = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-9)
-    return (b @ a).reshape(-1)
+def run_inference(args):
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    model, tokenizer = load_model(args.model_dir, device)
 
-def lexical_score(q_ws, d_ws):
-    # 官方给了 compute_lexical_matching_score；这里示意手工版本
-    s = 0.0
-    for tok, w in q_ws.items():
-        if tok in d_ws: s += w * d_ws[tok]
-    return s
+    text_embeddings_matrix = np.load(args.embeddings_path)
+    path_matrix = np.load(args.paths_path)
 
-def colbert_maxsim(q_vecs, d_vecs):
-    # 官方提供 model.colbert_score；这里给一个近似实现
-    import numpy as np
-    qn = q_vecs / (np.linalg.norm(q_vecs, axis=1, keepdims=True) + 1e-9)
-    dn = d_vecs / (np.linalg.norm(d_vecs, axis=1, keepdims=True) + 1e-9)
-    return (qn @ dn.T).max(axis=1).mean()
+    query_out = model.encode(tokenizer, [args.query], tower="a", max_length=args.max_length)
+    q_dense = query_out.numpy()
 
-query = "4行5列的表格"
+    dense_sim = util.cos_sim(torch.from_numpy(q_dense), torch.from_numpy(text_embeddings_matrix)).reshape(-1)
 
-q_out = m3.encode(
-    [query],
-    return_dense=True, return_sparse=True, return_colbert_vecs=True
-)
-q_dense = q_out["dense_vecs"][0]
-q_ws    = q_out["lexical_weights"][0]
-q_cols  = q_out["colbert_vecs"][0]
+    topk_indices = torch.argsort(dense_sim, descending=True)[: args.top_k]
+    candidates = [(dense_sim[i].item(), path_matrix[i]) for i in topk_indices]
 
-# 3. 计算相似度（矩阵化）
-# 稠密向量的余弦相似度
-dense_sim = util.cos_sim(q_dense, text_embeddings_matrix)  # [1, N]
-dense_sim = dense_sim.reshape(-1)  # 扁平化为 1D
+    os.makedirs(args.output_dir, exist_ok=True)
+    for score, img_path in candidates:
+        img_name = os.path.basename(img_path)
+        json_path = os.path.join("/".join(img_path.split("/")[:-1]).replace("final_good", "final_good_json"), img_name.replace(".png", ".json").replace(".jpg", ".json"))
+        output_path = os.path.join(args.output_dir, img_name)
+        output_json_path = os.path.join(args.output_dir, os.path.basename(json_path))
+        shutil.copy(img_path, output_path)
+        if os.path.exists(json_path):
+            shutil.copy(json_path, output_json_path)
+        print(f"Score: {score:.4f} | Image: {img_path}")
+    print(f"Results saved to {args.output_dir}")
 
-# # 稀疏词权的相似度
-# lexical_sim = np.array([
-#     # util.compute_lexical_matching_score(q_ws, d_ws)
-#     lexical_score(q_ws, d_ws)
-#     for d_ws in sparse_ws
-# ])  # [N,]
-    
-# # 多向量的相似度（利用 colbert 的 maxsim）
-# colbert_sim = np.array([
-#     # util.colbert_score(q_cols, d_vecs)  # 这里利用官方提供的 colbert_score
-#     colbert_maxsim(q_cols, d_vecs)
-#     for d_vecs in colbert_vs
-# ])  # [N,]
 
-# 4. 加权相似度
-# alpha, beta, gamma = 1.0, 0.3, 0.5  # 稠密/稀疏/多向量权重（示例值）
-# scores = alpha * dense_sim + beta * lexical_sim + gamma * colbert_sim  # [N,]
-scores = dense_sim
-print(scores)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run inference with finetuned dual-tower embeddings.")
+    parser.add_argument("--model_dir", type=str, required=True, help="Path to finetuned model directory.")
+    parser.add_argument("--embeddings_path", type=str, default="text_embeddings_finetuned.npy")
+    parser.add_argument("--paths_path", type=str, default="path_matrix_finetuned.npy")
+    parser.add_argument("--query", type=str, default="4行5列的表格")
+    parser.add_argument("--top_k", type=int, default=10)
+    parser.add_argument("--output_dir", type=str, default="./text_results")
+    parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available.")
+    return parser.parse_args()
 
-# 5. 按分数排序获取 Top-K 候选
-topk = torch.argsort(scores,descending=True)[:10]
-candidates = [(scores[i], path_matrix[i]) for i in topk]
 
-# 输出 Top-K
-for score, text in candidates:
-    print(f"Score: {score:.4f} | Text: {text}")
-    
-    # img_path = image_paths[idx]  # 从编码矩阵中获取对应的图像路径
-    img_name = os.path.basename(text)
-
-    json_path = os.path.join("/".join(text.split("/")[:-1]).replace("final_good", "final_good_json"), img_name.replace(".png", ".json"))
-    # print(json_path)
-    # exit()
-    output_path = os.path.join("./text_results", f"{img_name}")
-    output_json_path = os.path.join("./text_results", f"{os.path.basename(json_path)}")
-    os.makedirs("./text_results", exist_ok=True)
-    shutil.copy(text, output_path)  # 将最相似的图像复制到新的文件夹
-    shutil.copy(json_path, output_json_path)  # 将最相似的图像复制到新的文件夹
-    print(f"Saved similar image: {img_name} to {output_path}")
+if __name__ == "__main__":
+    run_inference(parse_args())
